@@ -1,12 +1,10 @@
-# Knowledge Enabled Short HEalth Misinformation detection framework (KESHEM)
+# TexAtt
 
-KESHEM is a health misinformation detection model.
-
-Please refer to our paper for more details.
+TexAtt是引入了外部的知识，实现对于训练样本的注意力优化的方法！
 
 
 ## How to use
-run ```./KESHEM/main.py``` file to train and test models. 
+run ```./TexAtt/main.py``` file to train and test models. 
 
 Principal environmental dependencies as follows:
 - [PyTorch 1.9.1](https://pytorch.org/)
@@ -14,5 +12,4 @@ Principal environmental dependencies as follows:
 - [numpy](https://github.com/numpy/numpy)
 - [pandas](https://github.com/pandas-dev/pandas)
 
-## Citation
-Please consider citing the following paper when using our code.
+
