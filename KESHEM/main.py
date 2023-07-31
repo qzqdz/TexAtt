@@ -1,7 +1,9 @@
 # -*- encoding:utf-8 -*-
-
+import math
 import os
+import pprint
 import random
+import re
 import sys
 import pickle
 import pandas as pd
@@ -12,11 +14,18 @@ from sklearn.preprocessing import LabelEncoder
 from torch.optim import optimizer
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.nn import CrossEntropyLoss,BCEWithLogitsLoss
+import ast
 
+from tqdm import tqdm
 
-# from pytorch_pretrained_bert import BertTokenizer, BertModel, BertForMaskedLM, BertConfig
-# from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
-from transformers import BertModel, BertTokenizer
+import util_loss
+import pickle
+from lion_pytorch import Lion
+from transformers import AutoModelForSeq2SeqLM, AutoModel, AutoTokenizer, T5Tokenizer, T5ForConditionalGeneration, \
+    AutoModelForCausalLM, LlamaTokenizer, LlamaForCausalLM
+
+from peft import get_peft_model, LoraConfig, TaskType
+
 
 
 import torch.nn as nn
@@ -30,6 +39,86 @@ import sklearn
 from torch.autograd import Variable
 from knowledgegraph import KnowledgeGraph, KnowledgeSentence
 
+import chardet
+def loss_choice(loss_func_name,class_freq,train_num,model_config):
+
+    gamma = 2
+    if model_config:
+        focal={}
+        logit_reg={}
+        map_param={}
+        CB_loss={}
+        if model_config['focal']:
+            focal = dict(focal=True, alpha=model_config['alpha'], gamma=gamma)
+        if model_config['logit_reg']:
+            logit_reg = dict(init_bias=model_config['init_bias'], neg_scale=model_config['neg_scale'])
+        if model_config['map_param']:
+            map_param = dict(alpha=model_config['map_alpha'], beta=model_config['map_beta'], gamma=model_config['map_gamma'])
+        if model_config['CB_loss']:
+            CB_loss = dict(alpha=model_config['CB_loss_alpha'], CB_mode='by_class')
+
+        loss_fct = util_loss.ResampleLoss(reweight_func=model_config['reweight_func'], loss_weight=model_config['loss_weight'],
+                                              focal=focal,
+                                              logit_reg=logit_reg,
+                                              map_param=map_param,
+                                              CB_loss=CB_loss,
+                                              class_freq=class_freq, train_num=train_num
+                                          )
+    else:
+        if loss_func_name == 'FL':
+            loss_fct = util_loss.ResampleLoss(reweight_func=None, loss_weight=1.0,
+                                              focal=dict(focal=True, alpha=1.0, gamma=gamma),
+                                              logit_reg=dict(),
+                                              class_freq=class_freq, train_num=train_num)
+
+        elif loss_func_name == 'CBloss':
+            loss_fct = util_loss.ResampleLoss(reweight_func='CB', loss_weight=5.0,
+                                              focal=dict(focal=True, alpha=0.5, gamma=gamma),
+                                              logit_reg=dict(),
+                                              CB_loss=dict(CB_beta=0.9, CB_mode='by_class'),
+                                              class_freq=class_freq, train_num=train_num)
+
+        elif loss_func_name == 'R-BCE-Focal':  # R-FL
+            loss_fct = util_loss.ResampleLoss(reweight_func='rebalance', loss_weight=1.0,
+                                              focal=dict(focal=True, alpha=0.5, gamma=gamma),
+                                              logit_reg=dict(),
+                                              map_param=dict(alpha=0.1, beta=10.0, gamma=0.05),
+                                              class_freq=class_freq, train_num=train_num)
+
+        elif loss_func_name == 'NTR-Focal':  # NTR-FL
+            loss_fct = util_loss.ResampleLoss(reweight_func=None, loss_weight=0.5,
+                                              focal=dict(focal=True, alpha=0.5, gamma=gamma),
+                                              logit_reg=dict(init_bias=0.05, neg_scale=2.0),
+                                              class_freq=class_freq, train_num=train_num)
+
+        elif loss_func_name == 'DBloss-noFocal':  # DB-0FL
+            loss_fct = util_loss.ResampleLoss(reweight_func='rebalance', loss_weight=0.5,
+                                              focal=dict(focal=False, alpha=0.5, gamma=gamma),
+                                              logit_reg=dict(init_bias=0.05, neg_scale=2.0),
+                                              map_param=dict(alpha=0.1, beta=10.0, gamma=0.05),
+                                              class_freq=class_freq, train_num=train_num)
+
+        elif loss_func_name == 'CBloss-ntr':  # CB-NTR
+            loss_fct = util_loss.ResampleLoss(reweight_func='CB', loss_weight=10.0,
+                                              focal=dict(focal=True, alpha=0.5, gamma=gamma),
+                                              logit_reg=dict(init_bias=0.05, neg_scale=2.0),
+                                              CB_loss=dict(CB_beta=0.9, CB_mode='by_class'),
+                                              class_freq=class_freq, train_num=train_num)
+
+        elif loss_func_name == 'DBloss':  # DB
+            loss_fct = util_loss.ResampleLoss(reweight_func='rebalance', loss_weight=1.0,
+                                              focal=dict(focal=True, alpha=0.5, gamma=gamma),
+                                              logit_reg=dict(init_bias=0.05, neg_scale=2.0),
+                                              map_param=dict(alpha=0.1, beta=10.0, gamma=0.05),
+                                              class_freq=class_freq, train_num=train_num)
+
+
+        else:
+            loss_fct = BCEWithLogitsLoss()
+    return loss_fct
+
+
+
 
 class DataPrecessForSingleSentence(object):
     """
@@ -40,7 +129,71 @@ class DataPrecessForSingleSentence(object):
         self.bert_tokenizer = bert_tokenizer
         self.pool = ThreadPoolExecutor(max_workers=max_workers)
 
-    def get_input(self, sentences, max_seq_len=30):
+    def get_input_token(self, sentences, max_seq_len):
+        # 切词
+        tokens_seq = list(
+            self.pool.map(self.bert_tokenizer.tokenize, sentences))
+        # 获取定长序列及其mask
+        result = list(
+            self.pool.map(self.trunate_and_pad, tokens_seq,
+                          [max_seq_len] * len(tokens_seq)))
+        return result
+
+    def get_input(self, sentences, knowledges, max_seq_len=128, num=1):
+        for i in range(len(sentences)):
+            if type(sentences[i]) == float:
+                sentences[i] = ''
+
+        if num>0:
+            # Concatenate knowledges and sentences
+            sentences = [f"{';'.join(knowledges[i][:min(num, len(knowledges[i]))])}[SEP]{sentence}"
+                         for i, sentence in enumerate(sentences)]
+
+        result = self.get_input_token(sentences, max_seq_len)
+
+
+
+        seqs = [i[0] for i in result]
+        seq_masks = [i[1] for i in result]
+        seq_segments = [i[2] for i in result]
+
+        # print('--------')
+        # print('here is the joint！')
+        # print(sentences[0])
+        #
+        # print(result)
+        # print('--------')
+
+        return seqs, seq_masks, seq_segments
+
+
+    # max_seq_len总长，max_seq_num每句句长
+    def get_input2(self, sentences, max_seq_len=32, max_seq_num=6):
+        sentences_sep = []
+        for each in sentences:
+            len_each = len(each)
+            if len_each<=1:
+                continue
+            elif len_each < max_seq_num:
+                each = each + [''] * (max_seq_num - len_each)
+            else:
+                each = each[:max_seq_num]
+            sentences_sep.append(each)
+
+        knowledges = []
+        # print('这里是sentences_sep')
+        # print(sentences_sep)
+        # print(type(sentences_sep))
+        for sentences in sentences_sep:
+            each_knowledge = []
+            result = self.get_input_token(sentences, max_seq_len)
+            for each in result:
+                each_knowledge.append(list(each))
+            knowledges.append(each_knowledge)
+        return knowledges
+
+
+    def get_input3(self, sentences, max_seq_len=128,knowledges=None,num=None):
         for i in range(len(sentences)):
             if type(sentences[i]) == float:
                 sentences[i] = ''
@@ -56,18 +209,25 @@ class DataPrecessForSingleSentence(object):
         seq_segments = [i[2] for i in result]
         return seqs, seq_masks, seq_segments
 
-    def get_input2(self, sentences, max_seq_len=30, max_seq_num=15):
+    # max_seq_len总长，max_seq_num每句句长
+    def get_input4(self, sentences, max_seq_len=32, max_seq_num=6, knowledges=None):
+
         sentences_sep = []
         for each in sentences:
             len_each = len(each)
-            if len_each < max_seq_num:
-                for i in range(len_each, max_seq_num):
-                    each.append('')
+            if len_each<=1:
+                continue
+            elif len_each < max_seq_num:
+                each = each + [''] * (max_seq_num - len_each)
             else:
                 each = each[:max_seq_num]
             sentences_sep.append(each)
 
         knowledges = []
+        # sentences_sep = [ssp for ssp in sentences_sep]
+        # print('这里是sentences_sep')
+        # print(sentences_sep)
+        # print(type(sentences_sep))
         for sentences in sentences_sep:
             each_knowledge = []
             # 切词
@@ -80,8 +240,45 @@ class DataPrecessForSingleSentence(object):
             for each in result:
                 each_knowledge.append(list(each))
             knowledges.append(each_knowledge)
-
+            # print('--------------')
+            # print('each kg')
+            # print(knowledges[-1])
+            # print('--------------')
         return knowledges
+
+    # large language model input~
+    def get_input5(self, sentences, knowledges, max_seq_len=128, num=1):
+        for i in range(len(sentences)):
+            if type(sentences[i]) == float:
+                sentences[i] = ''
+
+        return sentences
+
+
+    def get_input6(self, sentences, max_seq_num=6):
+        sentences_sep = []
+        for each in sentences:
+            len_each = len(each)
+            if len_each <= 1:
+                sentences_sep.append([''] * max_seq_num)
+                continue
+            elif len_each < max_seq_num:
+                each = each + [''] * (max_seq_num - len_each)
+            else:
+                each = each[:max_seq_num]
+            sentences_sep.append(each)
+
+            sentences_sep.append(each)
+
+        knowledges = []
+        for sentences in sentences_sep:
+            each_knowledge = []
+            # No need to encode the sentences, pass them directly to your model
+            each_knowledge.append(sentences)
+            knowledges.append(each_knowledge)
+        return knowledges
+
+
 
     def trunate_and_pad(self, seq, max_seq_len):
         # 对超长序列进行截断
@@ -104,25 +301,6 @@ class DataPrecessForSingleSentence(object):
         assert len(seq_segment) == max_seq_len
         return seq, seq_mask, seq_segment
 
-class CoAttention(nn.Module):
-    def __init__(self, device, latent_dim = 200):
-        super(CoAttention, self).__init__()
-        
-        self.linearq = nn.Linear(latent_dim, latent_dim)
-        self.lineark = nn.Linear(latent_dim, latent_dim)
-        self.linearv = nn.Linear(latent_dim, latent_dim)
-        
-    def forward(self, sentence_rep, comment_rep, labels):
-        
-        query = self.linearq(sentence_rep)
-        key = self.lineark(comment_rep)
-        value = self.linearv(comment_rep)
-        
-        alpha_mat = torch.matmul(query, key.transpose(1,2))
-        alpha = F.softmax(alpha_mat.sum(1, keepdim=True), dim=2)
-        x = torch.matmul(alpha, value).squeeze(1)
-
-        return x
 
 class FocalLoss(nn.Module):
     """
@@ -157,7 +335,7 @@ class FocalLoss(nn.Module):
     def forward(self, inputs, targets):
         N = inputs.size(0)
         C = inputs.size(1)
-        P = F.softmax(inputs)
+        P = F.softmax(inputs,dim=1)
 
         class_mask = inputs.data.new(N, C).fill_(0)
         class_mask = Variable(class_mask)
@@ -182,99 +360,330 @@ class FocalLoss(nn.Module):
             loss = batch_loss.sum()
         return loss
 
-class BertForSequenceClassification1(nn.Module):
-    def __init__(self, config, num_labels=2, device='cuda'): # Change number of labels here.
+
+class CoAttention(nn.Module):
+    def __init__(self, device, latent_dim=200):
+        super(CoAttention, self).__init__()
+
+        self.linearq = nn.Linear(latent_dim, latent_dim)
+        self.lineark = nn.Linear(latent_dim, latent_dim)
+        self.linearv = nn.Linear(latent_dim, latent_dim)
+
+    def forward(self, sentence_rep, comment_rep, labels):
+        query = self.linearq(sentence_rep)
+        key = self.lineark(comment_rep)
+        value = self.linearv(comment_rep)
+
+        alpha_mat = torch.matmul(query, key.transpose(1, 2))
+        alpha = F.softmax(alpha_mat.sum(1, keepdim=True), dim=2)
+        x = torch.matmul(alpha, value).squeeze(1)
+
+        return x
+
+# 旧版
+class MultiHeadAttention1(nn.Module):
+
+    def __init__(self, device, latent_dim=64, num_heads=4):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.attention_head_size = int(latent_dim / num_heads)
+        self.all_head_size = self.num_heads * self.attention_head_size
+
+        self.query = nn.Linear(latent_dim, self.all_head_size)
+        self.key = nn.Linear(latent_dim, self.all_head_size)
+        self.value = nn.Linear(latent_dim, self.all_head_size)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, sentence_rep, comment_rep, labels):
+        query_layer = self.transpose_for_scores(self.query(sentence_rep))
+        key_layer = self.transpose_for_scores(self.key(comment_rep))
+        value_layer = self.transpose_for_scores(self.value(comment_rep))
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+
+        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        return context_layer
+
+
+# 新版
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, device, latent_dim=64, num_heads=4):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.attention_head_size = int(latent_dim / num_heads)
+        self.all_head_size = self.num_heads * self.attention_head_size
+
+        self.query = nn.Linear(latent_dim, self.all_head_size)
+        self.key = nn.Linear(latent_dim, self.all_head_size)
+        self.value = nn.Linear(latent_dim, self.all_head_size)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, sentence_rep, comment_rep, labels):
+        query_layer = self.transpose_for_scores(self.query(comment_rep))  # swap here
+        key_layer = self.transpose_for_scores(self.key(sentence_rep))  # swap here
+        value_layer = self.transpose_for_scores(self.value(sentence_rep))  # swap here
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+
+        # Apply attention to the value layer
+        context_layer = torch.matmul(attention_probs, value_layer)
+
+        # Aggregate across the comment_rep dimension to ensure the output has the same batch size as sentence_rep
+        context_layer = context_layer.mean(dim=2)
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        return context_layer
+
+
+
+
+
+# bert
+class BertForSequenceClassification(nn.Module):
+    def __init__(self, model_path, num_labels=2, num_each_class=None, device='cuda'):
         super(BertForSequenceClassification, self).__init__()
         self.num_labels = num_labels
-        self.bert = BertModel.from_pretrained('bert_model')
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.latent_dim = 768
-        self.coattention = CoAttention(device, self.latent_dim)
-        self.classifier = nn.Linear(self.latent_dim*2, num_labels)
-        self.device = device
-        nn.init.xavier_normal_(self.classifier.weight)
-        self.tf_encoder_layer = nn.TransformerEncoderLayer(d_model=768, nhead=2)
-        self.tf_encoder = nn.TransformerEncoder(self.tf_encoder_layer, num_layers=2)
+        self.bert = AutoModel.from_pretrained(model_path)
+        try:
+            self.dropout = nn.Dropout(self.bert.config.hidden_dropout_prob)
+        except:
+            self.dropout = nn.Dropout(self.bert.config.dropout)
 
-    def forward_once(self, input_ids, token_type_ids=None, attention_mask=None):
-        _, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
+        self.device = device
+        self.num_each_class = num_each_class
+        nn.init.xavier_normal_(self.classifier.weight)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.config = self.bert.config
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, batch_knowledges=None, labels=None):
+        outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        pooled_output = outputs[1]
         pooled_output = self.dropout(pooled_output)
 
-        return pooled_output
-
-
-    def forward(self, batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, labels=None):
-        # forward pass of input 1
-        output1 = self.forward_once(batch_seqs, batch_seq_masks, batch_seq_segments)
-        output1 = torch.unsqueeze(output1, 1)
-        # forward pass of input 2
-        knowledges = batch_knowledges.cpu()
-        knowledges = knowledges.numpy().tolist()
-        tmp = []
-        # each是文本（编码）
-        for each in knowledges:
-            batch_seqs_k = [i[0] for i in each]
-            batch_seq_masks_k = [i[1] for i in each]
-            batch_seq_segments_k = [i[2] for i in each]
-            # 换上装备上
-            t_batch_seqs_k = torch.tensor(batch_seqs_k, dtype=torch.long).to(self.device)
-            t_batch_seq_masks_k = torch.tensor(batch_seq_masks_k, dtype = torch.long).to(self.device)
-            t_batch_seq_segments_k = torch.tensor(batch_seq_segments_k, dtype = torch.long).to(self.device)
-            # 再次计算损失，基于知识
-            output2 = self.forward_once(t_batch_seqs_k, t_batch_seq_masks_k, t_batch_seq_segments_k)
-            tmp.append(output2)
-        k_emb = torch.stack(tmp,dim=0)
-        k_emb = self.tf_encoder(k_emb)
-        k_emb = self.dropout(k_emb)
-        pooled_output = self.coattention(output1, k_emb, labels)
-
-        pooled_output = torch.cat([output1.squeeze(1), pooled_output], dim=1)
         logits = self.classifier(pooled_output)
 
         if labels is not None:
-            loss_fct = FocalLoss(2)
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            if self.num_labels>2:
+                # loss_func_name = 'FL'
+                # loss_func_name = 'CBloss'
+                # loss_func_name = 'R-BCE-Focal'
+                # loss_func_name = 'CBloss-ntr'
+                # loss_func_name = 'DBloss'
+                loss_func_name = 'BCE'
+
+
+                if loss_func_name=='BCE':
+                    loss_fct = FocalLoss(self.num_labels)
+                    # loss_fct = FocalLoss(self.num_labels)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+                elif self.num_each_class:
+                    train_num = sum(self.num_each_class)
+                    # print(self.num_each_class)
+                    loss_fct = loss_choice(loss_func_name, self.num_each_class, train_num, model_config=None)
+                    # print(logits)
+                    # print(logits.shape)
+                    # print(labels.shape)
+                    labels_one_hot = torch.nn.functional.one_hot(labels, num_classes=self.num_labels)
+                    loss = loss_fct(logits.double(), labels_one_hot.double())
+
+                else:
+                    loss_fct = FocalLoss(self.num_labels)
+                # loss_fct = FocalLoss(self.num_labels)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            else:
+                loss_fct = FocalLoss(self.num_labels)
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             return loss
         else:
             return logits
-        
+
+
+
+        # if labels is not None:
+        #     loss_fct = CrossEntropyLoss()
+        #     loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        #     return loss
+        # else:
+        #     return logits
+
     def freeze_bert_encoder(self):
         for param in self.bert.parameters():
             param.requires_grad = False
-    
+
     def unfreeze_bert_encoder(self):
         for param in self.bert.parameters():
             param.requires_grad = True
 
 
-class BertForSequenceClassification(nn.Module):
-    def __init__(self, model_path,num_labels=2, device='cuda'): # Change number of labels here.
+# no att
+class BertForSequenceClassification1(nn.Module):
+    def __init__(self, model_path, num_labels=2, num_each_class=None, device='cuda'): # Change number of labels here.
         super(BertForSequenceClassification, self).__init__()
         self.num_labels = num_labels
-        self.bert = BertModel.from_pretrained(model_path)
-        self.dropout = nn.Dropout(self.bert.config.hidden_dropout_prob)
+        self.bert = AutoModel.from_pretrained(model_path)
+
+        try:
+            self.dropout = nn.Dropout(0.3)
+        except:
+            self.dropout = nn.Dropout(self.bert.config.dropout)
+
+        # self.latent_dim = 1024
         self.latent_dim = 768
-        self.coattention = CoAttention(device, self.latent_dim)
-        self.classifier = nn.Linear(self.latent_dim*2, num_labels)
+        self.classifier = nn.Linear(self.latent_dim, num_labels)
         self.device = device
-        nn.init.xavier_normal_(self.classifier.weight)
+        self.num_each_class = num_each_class
         self.tf_encoder_layer = nn.TransformerEncoderLayer(d_model=768, nhead=2)
+        # self.tf_encoder_layer = nn.TransformerEncoderLayer(d_model=1024, nhead=2)
         self.tf_encoder = nn.TransformerEncoder(self.tf_encoder_layer, num_layers=2)
-        self.tokenizer = BertTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.config = self.bert.config
 
     def forward_once(self, input_ids, token_type_ids=None, attention_mask=None):
-        # _, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+        pooled_output = self.bert(input_ids, token_type_ids, attention_mask)
+        pooled_output = self.dropout(pooled_output[1])
+        return pooled_output
+
+
+    def forward(self, batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, labels=None):
+        output1 = self.forward_once(batch_seqs, batch_seq_masks, batch_seq_segments)
+        output1 = torch.unsqueeze(output1, 1)
+
+        knowledges = batch_knowledges.cpu()
+        knowledges = knowledges.numpy().tolist()
+        tmp = []
+        for each in knowledges:
+            batch_seqs_k = [i[0] for i in each]
+            batch_seq_masks_k = [i[1] for i in each]
+            batch_seq_segments_k = [i[2] for i in each]
+            t_batch_seqs_k = torch.tensor(batch_seqs_k, dtype=torch.long).to(self.device)
+            t_batch_seq_masks_k = torch.tensor(batch_seq_masks_k, dtype=torch.long).to(self.device)
+            t_batch_seq_segments_k = torch.tensor(batch_seq_segments_k, dtype=torch.long).to(self.device)
+            output2 = self.forward_once(t_batch_seqs_k, t_batch_seq_masks_k, t_batch_seq_segments_k)
+            tmp.append(output2)
+
+        k_emb = torch.stack(tmp, dim=0)
+        k_emb = self.tf_encoder(k_emb)
+
+        pooled_output = output1.squeeze(1)
+        logits = self.classifier(pooled_output)
+
+        if labels is not None:
+            if self.num_labels>2:
+                # loss_func_name = 'BCE'
+                loss_func_name = 'DBloss'
+
+                if loss_func_name == 'BCE':
+                    loss_fct = FocalLoss(self.num_labels)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                elif self.num_each_class:
+                    train_num = sum(self.num_each_class)
+                    loss_fct = loss_choice(loss_func_name, self.num_each_class, train_num, model_config=None)
+                    labels_one_hot = torch.nn.functional.one_hot(labels, num_classes=self.num_labels)
+                    loss = loss_fct(logits.double(), labels_one_hot.double())
+                else:
+                    loss_fct = FocalLoss(self.num_labels)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            else:
+                loss_fct = FocalLoss(self.num_labels)
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            return loss
+        else:
+            return logits
+
+    def freeze_bert_encoder(self):
+        for param in self.bert.parameters():
+            param.requires_grad = False
+
+    def unfreeze_bert_encoder(self):
+        for param in self.bert.parameters():
+            param.requires_grad = True
+
+# TexATT
+class BertForSequenceClassification1(nn.Module):
+    def __init__(self, model_path, num_labels=2, num_each_class=None, device='cuda'): # Change number of labels here.
+        super(BertForSequenceClassification, self).__init__()
+        self.num_labels = num_labels
+        self.bert = AutoModel.from_pretrained(model_path)
+
+        try:
+            # AB
+            self.dropout = nn.Dropout(0.3)
+            # self.dropout = nn.Dropout(self.bert.config.hidden_dropout_prob)
+        except:
+            self.dropout = nn.Dropout(self.bert.config.dropout)
+
+        self.latent_dim = 768
+        # self.latent_dim = 1024
+        # simple att
+        self.coattention = CoAttention(device, self.latent_dim)
+        # multi head att
+        # self.coattention = MultiHeadAttention(device, self.latent_dim,num_heads=2)
+
+        self.classifier = nn.Linear(self.latent_dim*2, num_labels)
+        self.device = device
+        self.num_each_class = num_each_class
+        # nn.init.xavier_normal_(self.classifier.weight)
+        self.tf_encoder_layer = nn.TransformerEncoderLayer(d_model=768, nhead=2)
+        # self.tf_encoder_layer = nn.TransformerEncoderLayer(d_model=1024, nhead=2)
+        self.tf_encoder = nn.TransformerEncoder(self.tf_encoder_layer, num_layers=2)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.config = self.bert.config
+
+        # Define the adapter module
+        # self.adapter = nn.Sequential(
+        #     nn.Linear(self.latent_dim, 64),  # adapter size 64
+        #     nn.ReLU(),
+        #     nn.Linear(64, self.latent_dim),
+        # )
+
+    def forward_once(self, input_ids, token_type_ids=None, attention_mask=None):
         pooled_output = self.bert(input_ids, token_type_ids, attention_mask)
 
         # 这里的drop改掉了
-        # pooled_output = self.dropout(pooled_output)
+        pooled_output = self.dropout(pooled_output[1])
 
-        return pooled_output[1]
+        # Apply the adapter module to the output of Bert
+        # pooled_output = self.adapter(pooled_output)
+
+        return pooled_output
+
+
+        # return self.bert(input_ids, token_type_ids, attention_mask)[1]
+
+
 
     def forward(self, batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, labels=None):
+
+
         # forward pass of input 1
         output1 = self.forward_once(batch_seqs, batch_seq_masks, batch_seq_segments)
+
+        # output1 = self.dropout(output1)
         output1 = torch.unsqueeze(output1, 1)
+
+
         # forward pass of input 2
         knowledges = batch_knowledges.cpu()
         knowledges = knowledges.numpy().tolist()
@@ -291,17 +700,65 @@ class BertForSequenceClassification(nn.Module):
             # 再次计算损失，基于知识
             output2 = self.forward_once(t_batch_seqs_k, t_batch_seq_masks_k, t_batch_seq_segments_k)
             tmp.append(output2)
+
         k_emb = torch.stack(tmp, dim=0)
         k_emb = self.tf_encoder(k_emb)
-        k_emb = self.dropout(k_emb)
-        pooled_output = self.coattention(output1, k_emb, labels)
+        # k_emb = self.dropout(k_emb)
 
+
+        pooled_output = self.coattention(output1, k_emb, labels)
+        # print('-----shape here!!--------')
+        # print(pooled_output.shape)
+
+        # Apply the adapter module to the output of coattention
+        # pooled_output = self.adapter(pooled_output)
+        # print(pooled_output.squeeze().shape, output1.squeeze(1).shape)
+
+        # pooled_output is reshaped to have dimensions [batch_size, feature_size]
+        pooled_output = pooled_output.view(-1, pooled_output.size(-1))
+
+        # Now we can concatenate along dimension 1
+        # print('-----shape here!--------')
+        # print(output1.shape)
+        # print(pooled_output.shape)
         pooled_output = torch.cat([output1.squeeze(1), pooled_output], dim=1)
+
+        # print(pooled_output.shape)
+
         logits = self.classifier(pooled_output)
 
         if labels is not None:
-            loss_fct = FocalLoss(2)
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            if self.num_labels>2:
+                # loss_func_name = 'FL'
+
+                # loss_func_name = 'CBloss'
+                # loss_func_name = 'R-BCE-Focal'
+                # loss_func_name = 'CBloss-ntr'
+                # loss_func_name = 'DBloss'
+                loss_func_name = 'BCE'
+
+                if loss_func_name == 'BCE':
+                    loss_fct = FocalLoss(self.num_labels)
+                    # loss_fct = FocalLoss(self.num_labels)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+                elif self.num_each_class:
+                    train_num = sum(self.num_each_class)
+                    # print(self.num_each_class)
+                    loss_fct = loss_choice(loss_func_name, self.num_each_class, train_num, model_config=None)
+                    # print(logits)
+                    # print(logits.shape)
+                    # print(labels.shape)
+                    labels_one_hot = torch.nn.functional.one_hot(labels, num_classes=self.num_labels)
+                    loss = loss_fct(logits.double(), labels_one_hot.double())
+
+                else:
+                    loss_fct = FocalLoss(self.num_labels)
+                # loss_fct = FocalLoss(self.num_labels)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            else:
+                loss_fct = FocalLoss(self.num_labels)
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             return loss
         else:
             return logits
@@ -315,20 +772,129 @@ class BertForSequenceClassification(nn.Module):
             param.requires_grad = True
 
 
+class LLM:
+    def __init__(self, model_path, device="cuda"):
+        if 'yuanzh' in model_path:
+            self.model = T5ForConditionalGeneration.from_pretrained(model_path, trust_remote_code=True)
+            self.tokenizer = T5Tokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model_type = 'chatyuan'
+        elif 'moss' in model_path:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).half().cuda()
+            self.model_type = 'moss'
+        elif 'llama' in model_path or 'vicuna' in model_path:
+            self.tokenizer = LlamaTokenizer.from_pretrained(model_path)
+            self.model = LlamaForCausalLM.from_pretrained(model_path)
+            self.model_type = 'llama'
+
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).half().cuda()
+            self.model_type = 'glm'
+        if type(device)==str:
+            if device=="cuda":
+                self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+            else:
+                self.device = torch.device('cpu')
+        else:
+            self.device = device
+
+        self.model.to(self.device)
+
+    def preprocess(self, text):
+        text = text.replace("\n", "\\n").replace("\t", "\\t")
+        return text
+
+    def postprocess(self, text):
+        return text.replace("\\n", "\n").replace("\\t", "\t")
+
+    def answer(self, text, sample=True, top_p=1, temperature=0.7):
+        if self.model_type=='chatyuan':
+            '''sample：是否抽样。生成任务，可以设置为True;
+            top_p：0-1之间，生成的内容越多样'''
+            text = self.preprocess(text)
+            encoding = self.tokenizer(text=[text], truncation=True, padding=True, max_length=768, return_tensors="pt").to(
+                self.device)
+            if not sample:
+                out = self.model.generate(**encoding, return_dict_in_generate=True, output_scores=False, max_new_tokens=512,
+                                     num_beams=1, length_penalty=0.6)
+            else:
+                out = self.model.generate(**encoding, return_dict_in_generate=True, output_scores=False, max_new_tokens=512,
+                                     do_sample=True, top_p=top_p, temperature=temperature, no_repeat_ngram_size=3)
+            out_text = self.tokenizer.batch_decode(out["sequences"], skip_special_tokens=True)
+            return self.postprocess(out_text[0])
+
+        elif self.model_type=='moss':
+            text = self.preprocess(text)
+            inputs = self.tokenizer(text, return_tensors="pt")
+            for k in inputs:
+                inputs[k] = inputs[k].cuda()
+            outputs = self.model.generate(**inputs, do_sample=True, temperature=temperature, top_p=0.8, repetition_penalty=1.02,
+                                     max_new_tokens=256)
+            response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            return self.postprocess(response)
+        elif self.model_type=='llama':
+            input_text = self.preprocess(text)
+            input_ids = self.tokenizer.encode(input_text, return_tensors='pt').to(
+                self.device)
+            output_ids = self.model.generate(input_ids, max_new_tokens=256, temperature=temperature, top_p=0.8)
+            output_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            return self.postprocess(output_text)
+
+        else:
+            text = self.preprocess(text)
+            response, _ = self.model.chat(self.tokenizer, text, history=[],temperature=temperature)
+            return self.postprocess(response)
+
+
+
+    def extract_label(self, text):
+        pattern = r"(FAVOR|NONE|AGAINST|积极|消极|中立|反对|认可)"
+        match = re.search(pattern, text)
+        if match:
+            label_dict = {
+                "AGAINST": 0, "反对": 0, "消极": 0, "嘲讽":0, "嘲笑":0, "反讽":0, "against":0,
+                "NONE": 1, "中立": 1,
+                "FAVOR": 2, "认可": 2, "积极": 2, "满意": 2, "favor":2
+            }
+            return label_dict[match.group(0)]
+        else:
+            # 如果没有匹配到任何标签词语，返回一个默认的标签
+            return 1  # 或者你可以选择抛出一个错误，例如：raise ValueError("No label found in text")
+
+
+
+
+
+
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # Path
-    parser.add_argument("--output_model_path", default="./models/classifier_model.bin", type=str,
-                        help="Path of the output model.")
+    parser.add_argument("--output_model_path", default="./models/pytorch_model.bin", type=str,
+                        help="Path of the output models.")
     parser.add_argument("--output_lossfig_path", default="./models/loss.png", type=str,
-                        help="Path of the output model.")
+                        help="Path of the output models.")
 
     # Model options.
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size.")
     parser.add_argument("--seq_length", type=int, default=128,
                         help="Sequence length.")
+    parser.add_argument("--kg_seq_length", type=int, default=128,
+                        help="Sequence length.")
+    parser.add_argument("--kg_each_seq_length", type=int, default=128,
+                        help="Sequence length.")
+    parser.add_argument("--cat_num", type=int, default=1,
+                        help="cat kg num for texts.")
+
+    # generate data
+    parser.add_argument("--n_for_combining", type=int, default=2,
+                        help="Generate the sample with n data.")
+
+    parser.add_argument("--g_m", type=int, default=300,
+                        help="Generate m samples for a topic and a stance.")
+
 
     # Optimizer options.
     parser.add_argument("--learning_rate", type=float, default=2e-5,
@@ -339,7 +905,7 @@ def main():
     # Training options.
     parser.add_argument("--dropout", type=float, default=0.5,
                         help="Dropout.")
-    parser.add_argument("--epochs_num", type=int, default=10,
+    parser.add_argument("--epochs_num", type=int, default=15,
                         help="Number of epochs.")
     parser.add_argument("--report_steps", type=int, default=100,
                         help="Specific steps to print prompt.")
@@ -347,7 +913,34 @@ def main():
                         help="Random seed.")
     parser.add_argument("--device", type=str, default='cuda',
                         help="Device use.")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay to use.")
+
+    parser.add_argument(
+        "--do_train",
+        type=bool,
+        default=False,
+        help="do train or not",
+    )
+
+    parser.add_argument(
+        "--llm",
+        type=bool,
+        default=False,
+        help="use llm or not",
+    )
+
+    parser.add_argument(
+        "--data_path", type=str, default=None, help="the path of profile with dev.csv, test.csv, train.csv."
+    )
+    parser.add_argument(
+        "--model_path", type=str, default=None, help="the path of profile with models"
+    )
+    parser.add_argument(
+        "--model_path_2", type=str, default=None, help="the path of profile with models"
+    )
+
+    parser.add_argument("--k", type=int, default=3, help="k of KNN")
+
 
     args = parser.parse_args()
 
@@ -358,92 +951,240 @@ def main():
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
-    
+
+    # 三分类
+    def count_label_ratio1(df, column='label'):
+        total = len(df)
+        count_0 = len(df[df[column] == 0])
+        count_1 = len(df[df[column] == 1])
+        count_2 = len(df[df[column] == 2])
+
+        return total,[count_0,count_1,count_2]
+
+    # 二分类
+    def count_label_ratio(df, column='label'):
+        total = len(df)
+        count_0 = len(df[df[column] == 0])
+        count_1 = len(df[df[column] == 1])
+
+        return total, [count_0, count_1]
+
     set_seed(args.seed)
-    
+
+    if args.data_path == None:
+        args.data_path = '/home/yindechun/Desktop/yanyu/data/zhihu/ATTTEX'
+        # /home/yindechun/Desktop/yanyu
     # 读取数据
     # train = pd.read_csv('data/train.tsv', encoding='utf-8', sep='\t')
     # dev = pd.read_csv('data/dev.tsv', encoding='utf-8', sep='\t')
     # test = pd.read_csv('data/test.tsv', encoding='utf-8', sep='\t')
-    train = pd.read_csv(r'E:\data\zhihu\ATTTEX/train.csv', encoding='utf-8')
-    dev = pd.read_csv(r'E:\data\zhihu\ATTTEX/dev.csv', encoding='utf-8')
-    test = pd.read_csv(r'E:\data\zhihu\ATTTEX/test.csv', encoding='utf-8')
 
+
+    rawdata = open(os.path.join(args.data_path,'train.csv'), 'rb').read()
+    result = chardet.detect(rawdata)
+    encoding = result['encoding']
+
+    train = pd.read_csv(os.path.join(args.data_path,'train.csv'), encoding=encoding)
+    dev = pd.read_csv(os.path.join(args.data_path,'dev.csv'), encoding=encoding)
+    test = pd.read_csv(os.path.join(args.data_path,'test.csv'), encoding=encoding)
+    kg = pd.read_excel(os.path.join(args.data_path,'related_topic.xlsx'))
+    kg = kg['aspect'].tolist()
+    kg = dict(zip(kg, kg))
+    train_total, num_each_class = count_label_ratio(train)
     # Load bert vocabulary and tokenizer
     # bert_config = BertConfig('bert_model/bert_config.json')
-    BERT_MODEL_PATH = r'E:\model\white_model\chinesebert'
+    # BERT_MODEL_PATH = r'E:\models\white_model\chinesebert'
+    BERT_MODEL_PATH = args.model_path
+    BERT_MODEL_PATH_2 = args.model_path_2
 
-    kg = ['CnDbpedia','webhealth','Medical']
-    lookdown = False
+    # kg = ['CnDbpedia','webhealth','Medical']
+    # lookdown = False
     # graph = KnowledgeGraph(kg, lookdown)
-    graph = KnowledgeSentence(tokenizer=BERT_MODEL_PATH,encoder=BERT_MODEL_PATH)
+
+    # knowledge_data_path = '/home/yindechun/Desktop/yanyu/data/sen_chinese_nlpcc_2016/kg_Iphone_SE.xlsx'
+    # knowledge_df = pd.read_excel(knowledge_data_path)
 
 
+    if not args.llm:
+        graph = KnowledgeSentence(model_path=BERT_MODEL_PATH,kg=kg, k=args.k)
+        bert_tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_PATH)
+        # 产生输入数据
+        processor = DataPrecessForSingleSentence(bert_tokenizer=bert_tokenizer)
+    else:
+        graph = KnowledgeSentence(model_path=BERT_MODEL_PATH_2, kg=kg, k=args.k)
+        bert_tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_PATH_2)
+        # 产生输入数据
+        processor = DataPrecessForSingleSentence(bert_tokenizer=bert_tokenizer)
 
-    # bert_tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_PATH, cache_dir=None, do_lower_case=False)
-    bert_tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_PATH)
-    # 产生输入数据
-    processor = DataPrecessForSingleSentence(bert_tokenizer=bert_tokenizer)
-    
+
     # train dataset
     # 1. get_input()返回的是seqs, seq_masks, seq_segments
-    seqs, seq_masks, seq_segments = processor.get_input(
-        sentences=train['text_a'].tolist(), max_seq_len=args.seq_length)
+    # Check if the file exists
+    print("start to match train data")
+    if os.path.exists('train_data.pkl'):
+        # Load train_data
+        with open('train_data.pkl', 'rb') as f:
+            train_dataloder = pickle.load(f)
+    else:
 
-    # 2. get_input2()返回的是knowledges
-    # 这个不是他妈的元组，是文本序列
-    knowledges_triples = graph.get_knowledge(train['text_a'].tolist())
+        if args.llm:
+            # Get the knowledges
+            knowledges_triples = graph.get_knowledge(train['text_a'].tolist())
+
+            # Get the sentences
+            sentences = train['text_a'].tolist()
+
+            # Get the labels
+            labels = train['label'].tolist()
+
+            # Create a list of tuples, each tuple contains a sentence, its corresponding knowledges and label
+            train_data = list(zip(sentences, knowledges_triples, labels))
+
+            # 打印数据样例
+            print('---------------------------')
+            print('train_data[0]:', train_data[0])
+            print('---------------------------')
 
 
-    knowledges = processor.get_input2(knowledges_triples)
 
-    # 3. labels是train['label'].tolist()
-    labels = train['label'].tolist()
-    t_seqs = torch.tensor(seqs, dtype=torch.long)
-    t_seq_masks = torch.tensor(seq_masks, dtype = torch.long)
-    t_seq_segments = torch.tensor(seq_segments, dtype = torch.long)
-    t_knowledges = torch.tensor(knowledges, dtype = torch.long)
-    t_labels = torch.tensor(labels, dtype = torch.long)
+            # Create a DataLoader
+            train_dataloder = DataLoader(dataset=train_data, shuffle=True, batch_size=args.batch_size)
 
+        else:
 
-    # 4. t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels是torch.tensor类型
-    train_data = TensorDataset(t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels)
+            # 2. get_input2()返回的是knowledges
+            # 这个不是他妈的元组，是文本序列
 
+            knowledges_triples = graph.get_knowledge(train['text_a'].tolist())
+            knowledges = processor.get_input2(knowledges_triples, max_seq_len=args.kg_seq_length, max_seq_num=args.kg_each_seq_length)
 
-    # 5. train_data是同样类型的TensorDatase
-    train_sampler = RandomSampler(train_data)
-    train_dataloder = DataLoader(dataset=train_data, sampler=train_sampler, batch_size=args.batch_size)
+            seqs, seq_masks, seq_segments = processor.get_input(
+                sentences=train['text_a'].tolist(), knowledges=knowledges_triples, max_seq_len=args.seq_length, num=args.cat_num)
 
 
-    # dev dataset
-    seqs, seq_masks, seq_segments = processor.get_input(
-        sentences=dev['text_a'].tolist(), max_seq_len=args.seq_length)
-    knowledges_triples = graph.get_knowledge(dev['text_a'].tolist())
-    knowledges = processor.get_input2(knowledges_triples)
-    labels = dev['label'].tolist()
-    t_seqs = torch.tensor(seqs, dtype=torch.long)
-    t_seq_masks = torch.tensor(seq_masks, dtype = torch.long)
-    t_seq_segments = torch.tensor(seq_segments, dtype = torch.long)
-    t_knowledges = torch.tensor(knowledges, dtype = torch.long)
-    t_labels = torch.tensor(labels, dtype = torch.long)
-    dev_data = TensorDataset(t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels)
-    dev_sampler = RandomSampler(dev_data)
-    dev_dataloder = DataLoader(dataset=dev_data, sampler=dev_sampler, batch_size=args.batch_size)
+            # 3. labels是train['label'].tolist()
+
+            # print('---------------------------')
+            # print('这里是知识序列')
+            # print(knowledges_triples[0])
+            # print(len(knowledges_triples[0]))
+            # print('这里是知识')
+            # print(knowledges[0])
+            # print(len(knowledges))
+            # print('这里是文段')
+            # print(seqs[0])
+            # print('---------------------------')
+
+            labels = train['label'].tolist()
+            t_seqs = torch.tensor(seqs, dtype=torch.long)
+            t_seq_masks = torch.tensor(seq_masks, dtype = torch.long)
+            t_seq_segments = torch.tensor(seq_segments, dtype = torch.long)
+            t_knowledges = torch.tensor(knowledges, dtype = torch.long)
+            t_labels = torch.tensor(labels, dtype = torch.long)
+
+
+            # 4. t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels是torch.tensor类型
+            train_data = TensorDataset(t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels)
+
+            # 5. train_data是同样类型的TensorDatase
+            train_sampler = RandomSampler(train_data)
+            train_dataloder = DataLoader(dataset=train_data, sampler=train_sampler, batch_size=args.batch_size)
+            # Save train_data
+
+
+        with open('train_data.pkl', 'wb') as f:
+            pickle.dump(train_dataloder, f)
+
+    print("start to match dev data")
+    if os.path.exists('dev_data.pkl'):
+        # Load train_data
+        with open('dev_data.pkl', 'rb') as f:
+            dev_dataloder = pickle.load(f)
+
+    else:
+        # dev dataset
+        if args.llm:
+            knowledges_triples = graph.get_knowledge(dev['text_a'].tolist())
+            sentences = dev['text_a'].tolist()
+
+            print('len here!!!! dev')
+            print(len(sentences))
+            print(len(knowledges_triples))
+
+            labels = dev['label'].tolist()
+            dev_data = list(zip(sentences, knowledges_triples, labels))
+            dev_dataloder = DataLoader(dataset=dev_data, shuffle=True, batch_size=args.batch_size)
+
+
+
+        else:
+
+            knowledges_triples = graph.get_knowledge(dev['text_a'].tolist())
+            knowledges = processor.get_input2(knowledges_triples,max_seq_len=args.kg_seq_length,max_seq_num=args.kg_each_seq_length)
+            seqs, seq_masks, seq_segments = processor.get_input(
+                sentences=dev['text_a'].tolist(), knowledges=knowledges_triples, max_seq_len=args.seq_length)
+            labels = dev['label'].tolist()
+            t_seqs = torch.tensor(seqs, dtype=torch.long)
+            t_seq_masks = torch.tensor(seq_masks, dtype = torch.long)
+            t_seq_segments = torch.tensor(seq_segments, dtype = torch.long)
+            t_knowledges = torch.tensor(knowledges, dtype = torch.long)
+            t_labels = torch.tensor(labels, dtype = torch.long)
+            dev_data = TensorDataset(t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels)
+            dev_sampler = RandomSampler(dev_data)
+            dev_dataloder = DataLoader(dataset=dev_data, sampler=dev_sampler, batch_size=args.batch_size)
+        # Save dev_data
+        with open('dev_data.pkl', 'wb') as f:
+            pickle.dump(dev_dataloder, f)
+
 
     # test dataset
-    seqs, seq_masks, seq_segments = processor.get_input(
-        sentences=test['text_a'].tolist(), max_seq_len=args.seq_length)
-    knowledges_triples = graph.get_knowledge(test['text_a'].tolist(), './kg/test_triples.txt', True, test['label'].tolist())
-    knowledges = processor.get_input2(knowledges_triples)
-    labels = test['label'].tolist()
-    t_seqs = torch.tensor(seqs, dtype=torch.long)
-    t_seq_masks = torch.tensor(seq_masks, dtype = torch.long)
-    t_seq_segments = torch.tensor(seq_segments, dtype = torch.long)
-    t_knowledges = torch.tensor(knowledges, dtype = torch.long)
-    t_labels = torch.tensor(labels, dtype = torch.long)
-    test_data = TensorDataset(t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels)
-    test_sampler = RandomSampler(test_data)
-    test_dataloder = DataLoader(dataset=test_data, sampler=test_sampler, batch_size=args.batch_size)
+    print("start to match test data")
+    if os.path.exists('test_data.pkl'):
+        # Load train_data
+        with open('test_data.pkl', 'rb') as f:
+            test_dataloder = pickle.load(f)
+
+    else:
+
+        if args.llm:
+            knowledges_triples = graph.get_knowledge(test['text_a'].tolist(), './kg/test_triples.txt', True,
+                                                     test['label'].tolist())
+            sentences = test['text_a'].tolist()
+            labels = test['label'].tolist()
+            test_data = list(zip(sentences, knowledges_triples, labels))
+            test_dataloder = DataLoader(dataset=test_data, shuffle=True, batch_size=args.batch_size)
+
+
+            print('len here!!!! test')
+            print(len(sentences))
+            print(len(knowledges_triples))
+            print(knowledges_triples[0])
+
+        else:
+            knowledges_triples = graph.get_knowledge(test['text_a'].tolist(), './kg/test_triples.txt', True, test['label'].tolist())
+            knowledges = processor.get_input2(knowledges_triples,max_seq_len=args.kg_seq_length,max_seq_num=args.kg_each_seq_length)
+            seqs, seq_masks, seq_segments = processor.get_input(
+                sentences=test['text_a'].tolist(), knowledges=knowledges_triples, max_seq_len=args.seq_length)
+            labels = test['label'].tolist()
+            t_seqs = torch.tensor(seqs, dtype=torch.long)
+            t_seq_masks = torch.tensor(seq_masks, dtype = torch.long)
+            t_seq_segments = torch.tensor(seq_segments, dtype = torch.long)
+            t_knowledges = torch.tensor(knowledges, dtype = torch.long)
+            t_labels = torch.tensor(labels, dtype = torch.long)
+            test_data = TensorDataset(t_seqs, t_seq_masks, t_seq_segments, t_knowledges, t_labels)
+            test_sampler = RandomSampler(test_data)
+            test_dataloder = DataLoader(dataset=test_data, sampler=test_sampler, batch_size=args.batch_size)
+
+        # Save test_data
+        with open('test_data.pkl', 'wb') as f:
+            pickle.dump(test_dataloder, f)
+
+
+    # free graph
+    del graph
+    torch.cuda.empty_cache()
+
+
 
     # For simplicity, we use DataParallel wrapper to use multiple GPUs.
     if args.device == 'cpu':
@@ -451,18 +1192,35 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # build classification model
-    # model = BertForSequenceClassification(bert_config, 2, device)
-    model = BertForSequenceClassification(BERT_MODEL_PATH, 2, device)
 
-    if device == 'cuda':
-        if torch.cuda.device_count() > 1:
-            print("{} GPUs are available. Let's use them.".format(torch.cuda.device_count()))
-            model = nn.DataParallel(model)
-    model = model.to(device)
+    # build classification models
+    # models = BertForSequenceClassification(bert_config, 2, device)
+    if not args.llm:
+        model = BertForSequenceClassification(BERT_MODEL_PATH, num_labels=len(num_each_class), num_each_class=num_each_class, device=device)
+
+        if device == 'cuda':
+            if torch.cuda.device_count() > 1:
+                print("{} GPUs are available. Let's use them.".format(torch.cuda.device_count()))
+                model = nn.DataParallel(model)
+        model = model.to(device)
+
+    else:
+        model = LLM(BERT_MODEL_PATH, device=device)
+
+    # peft_config = LoraConfig(
+    #     task_type=TaskType.SEQ_CLS,  # 选择你的任务类型为序列分类
+    #     inference_mode=False,
+    #     r=8,
+    #     lora_alpha=32,
+    #     lora_dropout=0.1
+    # )
+    # model = get_peft_model(model, peft_config)
+
+
+
 
     # evaluation function
-    def evaluate(args, is_test, metrics='f1'):
+    def evaluate1(args, is_test, metrics='f1'):
         if is_test:
             dataset = test_dataloder
             instances_num = test.shape[0]
@@ -471,17 +1229,21 @@ def main():
             dataset = dev_dataloder
             instances_num = dev.shape[0]
             print("The number of evaluation instances: ", instances_num)
-        
+
         correct = 0
         model.eval()
+
+        # Get the number of classes from the model output or dataset
+        num_classes = model.num_labels
+
         # Confusion matrix.
-        confusion = torch.zeros(2, 2, dtype=torch.long)
-        
+        confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+
         predict_all = np.array([], dtype=int)
         labels_all = np.array([], dtype=int)
         for i, batch_data in enumerate(dataset):
             batch_data = tuple(t.to(device) for t in batch_data)
-            batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels = batch_data        
+            batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels = batch_data
             with torch.no_grad():
                 logits = model(
                     batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, labels=None)
@@ -494,7 +1256,7 @@ def main():
             for j in range(pred.size()[0]):
                 confusion[pred[j], gold[j]] += 1
             correct += torch.sum(pred == gold).item()
-            
+
         if is_test:
             print("Confusion matrix:")
             print(confusion)
@@ -502,152 +1264,575 @@ def main():
 
         f1_avg = 0
         for i in range(confusion.size()[0]):
-            if confusion[i,:].sum().item() == 0:
+            if confusion[i, :].sum().item() == 0:
                 p = 0
             else:
-                p = confusion[i,i].item()/confusion[i,:].sum().item()
-            if confusion[:,i].sum().item() == 0:
+                p = confusion[i, i].item() / confusion[i, :].sum().item()
+            if confusion[:, i].sum().item() == 0:
                 r = 0
             else:
-                r = confusion[i,i].item()/confusion[:,i].sum().item()
-            if (p+r) == 0:
+                r = confusion[i, i].item() / confusion[:, i].sum().item()
+            if (p + r) == 0:
                 f1 = 0
             else:
-                f1 = 2*p*r / (p+r)
+                f1 = 2 * p * r / (p + r)
                 f1_avg += f1
-            if i == 1:
-                label_1_f1 = f1
-            print("Label {}: {:.4f}, {:.4f}, {:.4f}".format(i,p,r,f1))
-        print("Acc. (Correct/Total): {:.4f} ({}/{}) ".format(correct/instances_num, correct, instances_num))
-        #print("labels_all", labels_all, predict_all, len(labels_all))
-        test_auc = sklearn.metrics.roc_auc_score(labels_all, predict_all)
-        print(test_auc)
-        acc = sklearn.metrics.accuracy_score(labels_all, predict_all)
-        report = sklearn.metrics.classification_report(labels_all, predict_all,digits=4)
-        weighted_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='weighted')
-        print(report)
-        if metrics == 'Acc':
-            return correct/instances_num
-        elif metrics == 'f1':
-            #return f1_avg/2
-            return weighted_f1
+            print("Label {}: {:.4f}, {:.4f}, {:.4f}".format(i, p, r, f1))
+        print("Acc. (Correct/Total): {:.4f} ({}/{}) ".format(correct / instances_num, correct, instances_num))
+
+
+        if num_classes>2:
+            # Get classification report as a dict
+            report_dict = sklearn.metrics.classification_report(labels_all, predict_all, digits=4, output_dict=True)
+
+            # Add macro and micro average scores to the report dict
+            report_dict['macro avg'] = {
+                'precision': sklearn.metrics.precision_score(labels_all, predict_all, average='macro'),
+                'recall': sklearn.metrics.recall_score(labels_all, predict_all, average='macro'),
+                'f1-score': sklearn.metrics.f1_score(labels_all, predict_all, average='macro'),
+                'support': np.sum([report_dict[str(i)]['support'] for i in range(num_classes)])
+            }
+            report_dict['micro avg'] = {
+                'precision': sklearn.metrics.precision_score(labels_all, predict_all, average='micro'),
+                'recall': sklearn.metrics.recall_score(labels_all, predict_all, average='micro'),
+                'f1-score': sklearn.metrics.f1_score(labels_all, predict_all, average='micro'),
+                'support': np.sum([report_dict[str(i)]['support'] for i in range(num_classes)])
+            }
+
+            # Convert the report dict to a DataFrame
+            report_df = pd.DataFrame(report_dict).transpose()
+
+            # Convert the DataFrame to a string
+            report = report_df.to_string()
         else:
-            return correct/instances_num
+            report = sklearn.metrics.classification_report(labels_all, predict_all, digits=4)
+
+        acc = sklearn.metrics.accuracy_score(labels_all, predict_all)
+        weighted_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='weighted')
+
+        if num_classes>2:
+            macro_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='macro')
+            mirco_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='micro')
+        print('----------------------')
+        print(report)
+        print('----------------------')
+        if metrics == 'Acc':
+            return acc, None
+        elif metrics == 'f1':
+            if num_classes>2:
+                # Get the f1-score of the first and third class
+                f1_class1 = report_dict['0']['f1-score']
+                f1_class3 = report_dict['2']['f1-score']
+                # Calculate the average f1-score of the first and third class
+                avg_f1 = (f1_class1 + f1_class3) / 2
+                return avg_f1, None
+                # return macro_f1, mirco_f1
+            else:
+                return weighted_f1, None
+        else:
+            return acc, None
+
+
+    def evaluate(args, is_test, metrics='f1'):
+
+        if is_test:
+            dataset = test_dataloder
+            instances_num = test.shape[0]
+            print("The number of evaluation instances: ", instances_num)
+        else:
+            dataset = dev_dataloder
+            instances_num = dev.shape[0]
+            print("The number of evaluation instances: ", instances_num)
+
+        if not args.llm:
+
+            correct = 0
+            model.eval()
+
+            # Get the number of classes from the model output or dataset
+            num_classes = model.num_labels
+
+            # Confusion matrix.
+            confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+
+            predict_all = np.array([], dtype=int)
+            labels_all = np.array([], dtype=int)
+
+            for i, batch_data in enumerate(dataset):
+                batch_data = tuple(t.to(device) for t in batch_data)
+                batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels = batch_data
+                with torch.no_grad():
+                    logits = model(
+                        batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, labels=None)
+                pred = logits.softmax(dim=1).argmax(dim=1)
+                gold = batch_labels
+                labels = batch_labels.data.cpu().numpy()
+                predic = pred.data.cpu().numpy()
+                labels_all = np.append(labels_all, labels)
+                predict_all = np.append(predict_all, predic)
+                for j in range(pred.size()[0]):
+                    confusion[pred[j], gold[j]] += 1
+                    if pred[j] != gold[j]:
+                        with open('incorrect_predictions.txt', 'a') as f:
+                            text = model.tokenizer.decode(batch_seqs[j], skip_special_tokens=True)
+                            logits_str = ', '.join([f"{x:.4f}" for x in logits[j].cpu().numpy()])
+                            f.write(f"Text: {text}\nPredicted: {pred[j]}\nActual: {gold[j]}\nLogits: {logits_str}\n\n")
+
+                correct += torch.sum(pred == gold).item()
+
+            if is_test:
+                print("Confusion matrix:")
+                print(confusion)
+                print("Report precision, recall, and f1:")
+
+            f1_avg = 0
+            for i in range(confusion.size()[0]):
+                if confusion[i, :].sum().item() == 0:
+                    p = 0
+                else:
+                    p = confusion[i, i].item() / confusion[i, :].sum().item()
+                if confusion[:, i].sum().item() == 0:
+                    r = 0
+                else:
+                    r = confusion[i, i].item() / confusion[:, i].sum().item()
+                if (p + r) == 0:
+                    f1 = 0
+                else:
+                    f1 = 2 * p * r / (p + r)
+                    f1_avg += f1
+                print("Label {}: {:.4f}, {:.4f}, {:.4f}".format(i, p, r, f1))
+            print("Acc. (Correct/Total): {:.4f} ({}/{}) ".format(correct / instances_num, correct, instances_num))
+
+
+            if num_classes>2:
+                # Get classification report as a dict
+                report_dict = sklearn.metrics.classification_report(labels_all, predict_all, digits=4, output_dict=True)
+
+                # Add macro and micro average scores to the report dict
+                report_dict['macro avg'] = {
+                    'precision': sklearn.metrics.precision_score(labels_all, predict_all, average='macro'),
+                    'recall': sklearn.metrics.recall_score(labels_all, predict_all, average='macro'),
+                    'f1-score': sklearn.metrics.f1_score(labels_all, predict_all, average='macro'),
+                    'support': np.sum([report_dict[str(i)]['support'] for i in range(num_classes)])
+                }
+                report_dict['micro avg'] = {
+                    'precision': sklearn.metrics.precision_score(labels_all, predict_all, average='micro'),
+                    'recall': sklearn.metrics.recall_score(labels_all, predict_all, average='micro'),
+                    'f1-score': sklearn.metrics.f1_score(labels_all, predict_all, average='micro'),
+                    'support': np.sum([report_dict[str(i)]['support'] for i in range(num_classes)])
+                }
+
+                # Convert the report dict to a DataFrame
+                report_df = pd.DataFrame(report_dict).transpose()
+
+                # Convert the DataFrame to a string
+                report = report_df.to_string()
+            else:
+                report = sklearn.metrics.classification_report(labels_all, predict_all, digits=4)
+
+            acc = sklearn.metrics.accuracy_score(labels_all, predict_all)
+            weighted_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='weighted')
+            if num_classes>2:
+                macro_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='macro')
+                mirco_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='micro')
+            print('----------------------')
+            print(report)
+            print('----------------------')
+            if metrics == 'Acc':
+                return acc, None
+            elif metrics == 'f1':
+                if num_classes>2:
+                    # Get the f1-score of the first and third class
+                    f1_class1 = report_dict['0']['f1-score']
+                    f1_class3 = report_dict['2']['f1-score']
+                    # Calculate the average f1-score of the first and third class
+                    avg_f1 = (f1_class1 + f1_class3) / 2
+                    return avg_f1,None
+                    # return mirco_f1, macro_f1
+                else:
+                    return weighted_f1, None
+            else:
+                return acc, None
+
+        # -------------------------------------
+        # large language model~~~~
+        else:
+            correct = 0
+
+            # Define the class labels
+            class_labels = [0, 1, 2]
+
+            # Get the number of classes from the class labels
+            num_classes = len(class_labels)
+
+            # Confusion matrix.
+            confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+
+            predict_all = []
+            labels_all = []
+            all_ = 0
+            for i, batch_data in enumerate(dataset):
+                batch_data = tuple(t for t in batch_data)
+                batch_sentences, batch_knowledges, batch_labels = batch_data
+
+
+                # 预测
+                # Get predictions for each sentence in the batch
+                pred = []
+                batch_knowledges = list(map(list, zip(*batch_knowledges)))
+                # print('batch_knowledges')
+                # print(len(batch_knowledges))
+                # print(len(batch_knowledges[0]))
+
+                for sentence, knowledges in zip(batch_sentences, batch_knowledges):
+                    # chatyuan
+                    # input_text = "用户：分类以下文本态度：”"  + "\n“" + sentence.replace(' ','') + "” \n小元：在" + ",".join(knowledges[:1]) + ",文本的态度（积极、消极、中立）是:"
+                    # input_text = "用户：对于文本：“"+ sentence.replace(' ','') + "” \n小元：总的来说，文本对于Iphone SE的态度（积极、消极、中立）是"
+                    # input_text = "用户：对于文本：“"+ sentence.replace(' ','') + "” \n小元：总的来说，文本对于Iphone SE的态度（积极、消极、中立、反讽）是"
+                    #chatglm
+                    input_text = "用户：分类以下文本态度：“"+ sentence.replace(' ','') + "” \n总的来说，文本对于Iphone SE的态度（积极、消极、中立）是"
+
+                    #moss
+
+                    output_text = model.answer(input_text, temperature=0.1)
+                    all_+=1
+                    pred_ = model.extract_label(output_text)
+
+
+                    print(f'start ans:------------------')
+                    print('text:----')
+                    print(sentence)
+                    print('output_text:----')
+                    print(output_text)
+                    print('batch_knowledges:----')
+                    print(knowledges)
+                    print('>>>>>pred_res:',pred_)
+                    print('end ans------------------')
+                    pred.append(pred_)
+
+
+
+
+                gold = [class_labels[int(i.item())] for i in batch_labels]
+                print('start--------gl------------')
+                print(all_)
+                print(gold)
+                print(pred)
+                print('end--------gl------------')
+
+                labels_all.extend(gold)
+                predict_all.extend(pred)
+                assert len(labels_all) == len(
+                    predict_all), f"Lengths of labels_all and predict_all are not the same: {len(labels_all)} vs {len(predict_all)}, and the length of batch_sentences is {len(batch_knowledges)}, batch_knowledges's is {len(batch_knowledges)}."
+
+
+                for j in range(len(pred)):
+                    confusion[class_labels.index(pred[j]), class_labels.index(gold[j])] += 1
+                    if pred[j] != gold[j]:
+                        with open('incorrect_predictions.txt', 'a',encoding='utf-8') as f:
+                            text = batch_sentences[j]
+                            f.write(
+                                f"Text: {text}\nPredicted: {pred[j]}\nActual: {gold[j]}\nLogits:\n\n")
+
+                correct += sum([1 if pred[j] == gold[j] else 0 for j in range(len(pred))])
+
+            if is_test:
+                print("Confusion matrix:")
+                print(confusion)
+                print("Report precision, recall, and f1:")
+
+            f1_avg = 0
+            for i in range(confusion.size()[0]):
+                if confusion[i, :].sum().item() == 0:
+                    p = 0
+                else:
+                    p = confusion[i, i].item() / confusion[i, :].sum().item()
+                if confusion[:, i].sum().item() == 0:
+                    r = 0
+                else:
+                    r = confusion[i, i].item() / confusion[:, i].sum().item()
+                if (p + r) == 0:
+                    f1 = 0
+                else:
+                    f1 = 2 * p * r / (p + r)
+                    f1_avg += f1
+                print("Label {}: {:.4f}, {:.4f}, {:.4f}".format(i, p, r, f1))
+            print("Acc. (Correct/Total): {:.4f} ({}/{}) ".format(correct / instances_num, correct, instances_num))
+
+
+            if num_classes>2:
+                # Get classification report as a dict
+                report_dict = sklearn.metrics.classification_report(labels_all, predict_all, digits=4, output_dict=True)
+
+                # Add macro and micro average scores to the report dict
+                report_dict['macro avg'] = {
+                    'precision': sklearn.metrics.precision_score(labels_all, predict_all, average='macro'),
+                    'recall': sklearn.metrics.recall_score(labels_all, predict_all, average='macro'),
+                    'f1-score': sklearn.metrics.f1_score(labels_all, predict_all, average='macro'),
+                    'support': np.sum([report_dict[str(i)]['support'] for i in range(num_classes)])
+                }
+                report_dict['micro avg'] = {
+                    'precision': sklearn.metrics.precision_score(labels_all, predict_all, average='micro'),
+                    'recall': sklearn.metrics.recall_score(labels_all, predict_all, average='micro'),
+                    'f1-score': sklearn.metrics.f1_score(labels_all, predict_all, average='micro'),
+                    'support': np.sum([report_dict[str(i)]['support'] for i in range(num_classes)])
+                }
+
+                # Convert the report dict to a DataFrame
+                report_df = pd.DataFrame(report_dict).transpose()
+
+                # Convert the DataFrame to a string
+                report = report_df.to_string()
+            else:
+                report = sklearn.metrics.classification_report(labels_all, predict_all, digits=4)
+
+            acc = sklearn.metrics.accuracy_score(labels_all, predict_all)
+            weighted_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='weighted')
+            if num_classes>2:
+                macro_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='macro')
+                mirco_f1 = sklearn.metrics.f1_score(labels_all, predict_all, average='micro')
+            print('----------------------')
+            print(report)
+            print('----------------------')
+            if metrics == 'Acc':
+                return acc, None
+            elif metrics == 'f1':
+                if num_classes>2:
+                    # Get the f1-score of the first and third class
+                    f1_class1 = report_dict['0']['f1-score']
+                    f1_class3 = report_dict['2']['f1-score']
+                    # Calculate the average f1-score of the first and third class
+                    avg_f1 = (f1_class1 + f1_class3) / 2
+                    return avg_f1,None
+                    # return mirco_f1, macro_f1
+                else:
+                    return weighted_f1, None
+            else:
+                return acc, None
+
 
 
     # training phase
-    print("Start training.")
-    instances_num = train.shape[0]
-    batch_size = args.batch_size
-    train_steps = int(instances_num * args.epochs_num / batch_size) + 1
+    if args.do_train:
+        if args.llm:
 
-    print("Batch size: ", batch_size)
-    print("The number of training instances:", instances_num)
+            # Define a new DataFrame to store the new samples
+            new_samples_df = pd.DataFrame(columns=['order', 'text_a', 'label', 'Target'])
+
+            # Check the column name for 'Target' and convert it to standard format
+            target_column = None
+            for column in train.columns:
+                if column.lower() == 'target':
+                    target_column = column
+                    break
+
+            if target_column is None:
+                raise ValueError("No 'Target' column found in the data.")
+
+            # Get unique label, target pairs
+            unique_pairs = train[['label', target_column]].drop_duplicates().values
+
+            # Define a dictionary to map the numerical labels to their textual representations
+            # label_dict = {0: 'AGAINST', 1: 'NONE', 2: 'FAVOR'}
+            label_dict = {0: '反对', 1: '中立', 2: '认可'}
+
+            # Initialize a counter for the order
+            counter = 0
+
+            # For each unique label, target pair
+            for label, target in tqdm(unique_pairs, desc='Generating new samples'):
+                # Filter the DataFrame for rows with this label and target
+                filtered_df = train[(train['label'] == label) & (train[target_column] == target)]
+                filtered_df = filtered_df.reset_index()
+                atti = label_dict[int(filtered_df.loc[0, 'label'])]
+
+                # Randomly draw m samples
+                for i in tqdm(range(args.g_m), desc='Randomly drawing samples'):
+                    # Randomly select n rows from the filtered DataFrame
+                    sample_df = filtered_df.sample(args.n_for_combining)
+
+                    # Combine the selected samples into one sample
+                    combined_text = '\n'.join(sample_df['text_a'])
+
+                    # Generate the prompt
+                    # 要求态度一致({label_dict[label]} 在话题"{target}"中):
+                    # prompt = f'''请你融合以下文本中的信息，重新表述：{combined_text}'''
+                    # prompt = f'''请你代表他们观点进行简短的发言：{combined_text}'''
+                    # prompt = f'''生成相似言论：{combined_text}'''
+                    prompt = f'''生成一句简短的{atti}态度言论：\n{combined_text}'''
+                    # prompt = f'''Please generate a new statement btased on the following statements, requiring that the statement be consistent with the stance and attitude of the original statement.({label_dict[label]} in the target "{target}"):\n{combined_text}'''
+
+                    # Generate a new sample
+                    new_sample = model.answer(prompt)
+
+                    # Print the prompt and the new sample
+                    print(f'start prompt, No.{counter + 1}------------------------------------')
+                    print('prompt')
+                    print(prompt)
+                    print('res')
+                    print(new_sample)
+                    # print(new_samples_df.head())
+                    print('end prompt------------------------------------')
+
+                    # Add the new sample to the new_samples_df DataFrame
+                    new_samples_df.loc[counter] = [counter, new_sample, label, target]
+                    counter += 1
 
 
-    # 待优化的参数
-    # param_optimizer = list(model.named_parameters())
-    # no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    # optimizer_grouped_parameters = [
-    #     {
-    #         'params':
-    #         [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-    #         'weight_decay':
-    #         0.01
-    #     },
-    #     {
-    #         'params':
-    #         [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-    #         'weight_decay':
-    #         0.0
-    #     }
-    # ]
-    # optimizer = BertAdam(optimizer_grouped_parameters,
-    #                     lr=args.learning_rate,
-    #                     warmup=args.warmup,
-    #                     t_total=train_steps)
-
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+            new_samples_df.to_csv('new_samples.csv', index=False)
 
 
-    # 存储每一个batch的loss
-    all_loss = []
-    all_acc = []
-    total_loss = 0.0
-    result = 0.0
-    best_result = 0.0
 
-    for epoch in range(1, args.epochs_num+1):
-        model.train()
-        for step, batch_data in enumerate(train_dataloder):
-            batch_data = tuple(t.to(device) for t in batch_data)
-            # batch_seps是编码后文本，batch_seq_masks是文本的mask，batch_seq_segments是文本的segment
-            # batch_labels是标签
-            # batch_knowledges是知识库，句子编码
-            batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels = batch_data
-            # 对标签进行onehot编码
-            one_hot = torch.zeros(batch_labels.size(0), 2).long()
-            '''one_hot_batch_labels = one_hot.scatter_(
-                dim=1,
-                index=torch.unsqueeze(batch_labels, dim=1),
-                src=torch.ones(batch_labels.size(0), 2).long())
-
-            
-            logits = model(
-                batch_seqs, batch_seq_masks, batch_seq_segments, labels=None)
-            logits = logits.softmax(dim=1)
-            loss_function = CrossEntropyLoss()
-            loss = loss_function(logits, batch_labels)'''
-            # 输入了batch_knowledges
-            loss = model(
-                batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels)
-            loss.backward()
-            total_loss += loss.item()
-            if (step + 1) % 100 == 0:
-                print("Epoch id: {}, Training steps: {}, Avg loss: {:.4f}".format(epoch, step+1, total_loss / 100))
-                sys.stdout.flush()
-                total_loss = 0.
-            #print("Epoch id: {}, Training steps: {}, Avg loss: {:.3f}".format(epoch, step+1, loss))
-            optimizer.step()
-            optimizer.zero_grad()
-        
-        all_loss.append(total_loss)
-        total_loss = 0.
-        print("Start evaluation on dev dataset.")
-        result = evaluate(args, False)
-        all_acc.append(result)
-        if result > best_result:
-            best_result = result
-            #torch.save(model, open(args.output_model_path,"wb"))
-            #save_model(model, args.output_model_path)
-            torch.save(model.state_dict(), args.output_model_path)
         else:
-            continue
+            print("Start training.")
+            instances_num = train.shape[0]
+            batch_size = args.batch_size
+            train_steps = int(instances_num * args.epochs_num / batch_size) + 1
 
-        print("Start evaluation on test dataset.")
-        evaluate(args, True)
-    
-    print('all_loss:', all_loss)
-    print('all_acc:', all_acc)
+            print("Batch size: ", batch_size)
+            print("The number of training instances:", instances_num)
 
+
+            # 待优化的参数
+            # param_optimizer = list(models.named_parameters())
+            # no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+            # optimizer_grouped_parameters = [
+            #     {
+            #         'params':
+            #         [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+            #         'weight_decay':
+            #         0.01
+            #     },
+            #     {
+            #         'params':
+            #         [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+            #         'weight_decay':
+            #         0.0
+            #     }
+            # ]
+            # optimizer = BertAdam(optimizer_grouped_parameters,
+            #                     lr=args.learning_rate,
+            #                     warmup=args.warmup,
+            #                     t_total=train_steps)
+
+            # Optimizer
+            # Split weights in two groups, one with weight decay and the other not.
+
+
+            # no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+            no_decay = ["bias", "LayerNorm.weight"]
+            optimizer_grouped_parameters = [
+                {
+                    'params':
+                        [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                    'weight_decay':
+                        args.weight_decay
+                },
+                {
+                    'params':
+                        [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                    'weight_decay':
+                        0.0
+                }
+            ]
+
+
+
+            optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+            # optimizer = Lion(optimizer_grouped_parameters, lr=args.learning_rate)
+            # optimizer = Lion(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+            # 存储每一个batch的loss
+            all_loss = []
+            all_acc = []
+            total_loss = 0.0
+            result = 0.0
+            best_result = 0.0
+
+            for epoch in range(1, args.epochs_num + 1):
+                model.train()
+                print('start epoch---------------------------------------')
+                print(f'epoch:{epoch}')
+                for step, batch_data in tqdm(enumerate(train_dataloder), total=len(train_dataloder)):
+                    batch_data = tuple(t.to(device) for t in batch_data)
+                    # batch_seps是编码后文本，batch_seq_masks是文本的mask，batch_seq_segments是文本的segment
+                    # batch_labels是标签
+                    # batch_knowledges是知识库，句子编码
+                    batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels = batch_data
+                    # 对标签进行onehot编码
+                    one_hot = torch.zeros(batch_labels.size(0), 2).long()
+                    '''one_hot_batch_labels = one_hot.scatter_(
+                        dim=1,
+                        index=torch.unsqueeze(batch_labels, dim=1),
+                        src=torch.ones(batch_labels.size(0), 2).long())
+        
+                    
+                    logits = models(
+                        batch_seqs, batch_seq_masks, batch_seq_segments, labels=None)
+                    logits = logits.softmax(dim=1)
+                    loss_function = CrossEntropyLoss()
+                    loss = loss_function(logits, batch_labels)'''
+                    # 输入了batch_knowledges
+
+                    # 输入了batch_knowledges
+                    # inputs = {
+                    #     'input_ids': batch_seqs,
+                    #     'attention_mask': batch_seq_masks,
+                    #     'token_type_ids': batch_seq_segments,
+                    #     'knowledge_ids': batch_knowledges,
+                    #     'labels': batch_labels
+                    # }
+
+
+                    loss = model(
+                        batch_seqs, batch_seq_masks, batch_seq_segments, batch_knowledges, batch_labels)
+                    # loss = model(**inputs)
+
+                    loss.backward()
+                    total_loss += loss.item()
+                    if (step + 1) % 100 == 0:
+                        print("Epoch id: {}, Training steps: {}, Avg loss: {:.4f}".format(epoch, step+1, total_loss / 100))
+                        sys.stdout.flush()
+                        total_loss = 0.
+                    #print("Epoch id: {}, Training steps: {}, Avg loss: {:.3f}".format(epoch, step+1, loss))
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+
+                print(f'end epoch{epoch}---------------------------------------')
+
+                all_loss.append(total_loss)
+                total_loss = 0.
+                print("Start evaluation on dev dataset.")
+
+                # 多分类这里来改
+                result = evaluate(args, False, metrics='f1')[0]
+                all_acc.append(result)
+                if result > best_result:
+                    best_result = result
+                    #torch.save(models, open(args.output_model_path,"wb"))
+                    #save_model(models, args.output_model_path)
+                    torch.save(model.state_dict(), args.output_model_path)
+                else:
+                    continue
+
+                print("Start evaluation on test dataset.")
+                evaluate(args, True)
+
+            print('all_loss:', all_loss)
+            print('all_acc:', all_acc)
+
+
+
+    # 测试阶段
     # Evaluation phase.
     print("Final evaluation on the test dataset.")
-    model.load_state_dict(torch.load(args.output_model_path))
+    if not args.llm:
+        model.load_state_dict(torch.load(args.output_model_path))
+
     evaluate(args, True)
+
+
 
     '''
     print(loss_collect)
